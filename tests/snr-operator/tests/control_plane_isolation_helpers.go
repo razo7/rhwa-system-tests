@@ -15,6 +15,8 @@ import (
 	"github.com/medik8s/system-tests/tests/snr-operator/internal/snrparams"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -32,12 +34,12 @@ func agentNamespaceScript(iptablesCmds []string) string {
 	var builder strings.Builder
 
 	builder.WriteString("set -e\n")
-	builder.WriteString(fmt.Sprintf("pid=$(pgrep -f %q | head -1)\n", snrparams.AgentProcessPattern))
+	fmt.Fprintf(&builder, "pid=$(pgrep -f %q | head -1)\n", snrparams.AgentProcessPattern)
 	builder.WriteString(`if [ -z "$pid" ]; then echo AGENT_PID_NOT_FOUND; exit 1; fi` + "\n")
 	builder.WriteString(`echo "agent pid: $pid"` + "\n")
 
 	for _, cmd := range iptablesCmds {
-		builder.WriteString(fmt.Sprintf("nsenter -t \"$pid\" -n -- %s\n", cmd))
+		fmt.Fprintf(&builder, "nsenter -t \"$pid\" -n -- %s\n", cmd)
 	}
 
 	builder.WriteString("echo DONE\n")
@@ -85,7 +87,6 @@ func deleteHostCommandPod(podName string) {
 // returns, so a killed run does not block the next one.
 func runHostCommandPod(nodeName, podName, script string) (corev1.PodPhase, string) {
 	deleteHostCommandPod(podName)
-
 	_, createErr := pod.NewBuilder(
 		APIClient, podName, medik8sparams.OperatorNs, snrparams.InjectorImage).
 		DefineOnNode(nodeName).
@@ -194,47 +195,107 @@ func agentPodOnNode(nodeName string) (*pod.Builder, error) {
 	return nil, fmt.Errorf("no SNR agent pod found on node %q", nodeName)
 }
 
-// agentLogOnNodeContains reports whether message appears in the recent log of
-// the agent pod on nodeName. Unlike findMessageInDSPodLogs it is scoped to one
-// node, so a message emitted by a different node's agent cannot satisfy it.
-func agentLogOnNodeContains(nodeName, message string, logWindow time.Duration) bool {
+// agentLogOnNode returns the recent log of the agent pod on nodeName and whether
+// it could be read. Scoped to one node so a message emitted by a different node's
+// agent cannot be observed. Callers that need several messages should read the
+// log once with this and assert against the returned snapshot, rather than
+// re-reading per message: once the victim reboots, its agent pod is replaced and
+// the new pod's log no longer holds the pre-reboot messages.
+func agentLogOnNode(nodeName string, logWindow time.Duration) (string, bool) {
 	agentPod, err := agentPodOnNode(nodeName)
 	if err != nil {
 		GinkgoWriter.Printf("Could not find agent pod on node %s: %v\n", nodeName, err)
 
-		return false
+		return "", false
 	}
 
 	logText, err := agentPod.GetLog(logWindow, snrparams.ManagerContainerName)
 	if err != nil {
 		GinkgoWriter.Printf("Could not read agent log on node %s: %v\n", nodeName, err)
 
-		return false
+		return "", false
 	}
 
-	return strings.Contains(logText, message)
+	return logText, true
 }
 
 // nhcSelectsControlPlane reports whether any NodeHealthCheck in the cluster
 // selects control plane nodes. One would remediate the victim through the
 // ordinary NHC path, so the test skips rather than reporting a false pass.
-func nhcSelectsControlPlane(ctx context.Context) bool {
+//
+// It returns an error when the NHC inventory cannot be determined. When the
+// NodeHealthCheck CRD is not installed the cluster has no NHC, so it returns
+// (false, nil); any other list error is returned so the precondition fails
+// instead of silently proceeding as if no NHC selected the victim.
+func nhcSelectsControlPlane(ctx context.Context) (bool, error) {
 	nhcList := medik8sparams.NewUnstructuredList(
 		snrparams.NHCAPIGroup, snrparams.NHCAPIVersion, "NodeHealthCheck")
 	if err := APIClient.List(ctx, nhcList); err != nil {
-		GinkgoWriter.Printf("Could not list NodeHealthCheck CRs: %v\n", err)
+		if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+			return false, nil
+		}
 
-		return false
+		return false, fmt.Errorf("could not list NodeHealthCheck CRs: %w", err)
 	}
 
 	for idx := range nhcList.Items {
-		if strings.Contains(fmt.Sprintf("%v", nhcList.Items[idx].Object["spec"]), "control-plane") ||
-			strings.Contains(fmt.Sprintf("%v", nhcList.Items[idx].Object["spec"]), "master") {
+		if nhcSpecSelectsControlPlane(nhcList.Items[idx].Object) {
 			GinkgoWriter.Printf("NodeHealthCheck %q selects control plane nodes\n", nhcList.Items[idx].GetName())
 
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// nhcSpecSelectsControlPlane parses a NodeHealthCheck's spec.selector (a standard
+// metav1.LabelSelector) and reports whether it positively selects control plane
+// nodes. It inspects matchLabels and matchExpressions for a control plane role
+// key, counting an expression only when its operator is In or Exists. This avoids
+// the false positive a plain substring scan hit on a worker-only NHC that
+// excludes control plane nodes with a DoesNotExist expression on the same key.
+//
+// This is a conservative check on the selector shape, not a full label match
+// against the victim node (the victim is not yet chosen when the precondition
+// runs). A NHC whose selector matches control plane nodes through unrelated
+// custom labels would not be detected here.
+func nhcSpecSelectsControlPlane(obj map[string]interface{}) bool {
+	selector, found, err := unstructured.NestedMap(obj, "spec", "selector")
+	if err != nil || !found {
+		return false
+	}
+
+	matchLabels, _, _ := unstructured.NestedStringMap(selector, "matchLabels")
+	for key := range matchLabels {
+		if isControlPlaneRoleKey(key) {
+			return true
+		}
+	}
+
+	expressions, _, _ := unstructured.NestedSlice(selector, "matchExpressions")
+	for _, raw := range expressions {
+		expr, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		key, _, _ := unstructured.NestedString(expr, "key")
+		operator, _, _ := unstructured.NestedString(expr, "operator")
+
+		if isControlPlaneRoleKey(key) &&
+			(operator == string(metav1.LabelSelectorOpIn) ||
+				operator == string(metav1.LabelSelectorOpExists)) {
 			return true
 		}
 	}
 
 	return false
+}
+
+// isControlPlaneRoleKey reports whether key is one of the standard node role
+// labels that mark a control plane node.
+func isControlPlaneRoleKey(key string) bool {
+	return key == "node-role.kubernetes.io/control-plane" ||
+		key == "node-role.kubernetes.io/master"
 }

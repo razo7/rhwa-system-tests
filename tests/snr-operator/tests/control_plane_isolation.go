@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -17,6 +18,7 @@ import (
 	"github.com/medik8s/system-tests/tests/snr-operator/internal/snrparams"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -28,7 +30,7 @@ import (
 // fix the passing /readyz reset errorCount on every tick and the node fed its
 // watchdog forever.
 //
-// Full specification: docs/TESTCASES/rhwa-1927.md
+// See docs/TESTCASES/rhwa-1927.md for the full specification.
 var _ = Describe("SNR Functional - Control Plane Isolation",
 	Serial, Ordered, ContinueOnFailure,
 	Label(labels.OperatorSNR, snrparams.Label,
@@ -52,7 +54,10 @@ var _ = Describe("SNR Functional - Control Plane Isolation",
 				snrparams.MinReadyMasterNodes)
 
 			By("Skipping when a NodeHealthCheck selects control plane nodes")
-			if nhcSelectsControlPlane(ctx) {
+			selectsCP, err := nhcSelectsControlPlane(ctx)
+			Expect(err).ToNot(HaveOccurred(),
+				"Must determine whether any NodeHealthCheck selects control plane nodes")
+			if selectsCP {
 				Skip("A NodeHealthCheck selects control plane nodes; it would remediate the victim " +
 					"through the NHC path and the reboot would not prove the isolation gate ran")
 			}
@@ -136,7 +141,7 @@ var _ = Describe("SNR Functional - Control Plane Isolation",
 
 		It("should remediate a control plane node isolated from its SNR peers while readyz passes",
 			reportxml.ID("1927"),
-			Label(labels.TierResiliency, labels.DisruptionDestructive,
+			Label(labels.TierResiliency,
 				labels.PlatformAny, labels.TopologyControlPlane, labels.ComponentRemediation),
 			func() {
 				By("Recording boot ID and creation timestamp for every control plane node")
@@ -159,8 +164,10 @@ var _ = Describe("SNR Functional - Control Plane Isolation",
 
 				By("Confirming the victim agent reports no API error before the partition")
 
-				Expect(agentLogOnNodeContains(targetMasterName,
-					snrparams.APICheckFailureMessage, snrparams.CPIsolationLogWindow)).To(BeFalse(),
+				preIsolationLog, ok := agentLogOnNode(targetMasterName, snrparams.CPIsolationLogWindow)
+				Expect(ok).To(BeTrue(),
+					"Must read the victim agent log on %s before the partition", targetMasterName)
+				Expect(preIsolationLog).NotTo(ContainSubstring(snrparams.APICheckFailureMessage),
 					"Agent on %s must not report an API error before the peer port is blocked; "+
 						"this test must exercise the isolation gate, not the API-error branch",
 					targetMasterName)
@@ -189,31 +196,37 @@ var _ = Describe("SNR Functional - Control Plane Isolation",
 					"Master %s must stay Ready while only its agent peer port is blocked, "+
 						"which is what proves /readyz is still returning 200", targetMasterName)
 
-				By("Waiting for the victim agent to consult its peers after crossing the error threshold")
+				By("Capturing the victim agent log once it has logged the reboot trigger")
+
+				// Capture the agent log in the same poll iteration that first sees the
+				// reboot-trigger message, which the agent emits last in the isolation
+				// sequence. Reading all three messages from one pre-reboot snapshot
+				// avoids the race where the node reboots mid-sequence and a later,
+				// separate log read hits the fresh post-reboot agent pod whose log no
+				// longer holds the earlier messages.
+				var isolationLog string
 
 				Eventually(func() bool {
-					return agentLogOnNodeContains(targetMasterName,
-						snrparams.PeerConsultationMessage, snrparams.CPIsolationLogWindow)
+					logText, ok := agentLogOnNode(targetMasterName, snrparams.CPIsolationLogWindow)
+					if !ok {
+						return false
+					}
+
+					isolationLog = logText
+
+					return strings.Contains(logText, snrparams.CPIsolationRebootTriggeredMessage)
 				}, snrparams.CPIsolationDetectTimeout, snrparams.DefaultPollInterval).Should(BeTrue(),
-					"Agent on %s must consult peers after maxApiErrorThreshold consecutive failures",
-					targetMasterName)
+					"Agent on %s must log the reboot trigger; captured before the reboot so the "+
+						"earlier isolation messages are not lost", targetMasterName)
 
-				By("Waiting for the victim agent to log that readyz passed but no control plane peers are reachable")
+				By("Verifying the captured agent log shows the full isolation sequence")
 
-				Eventually(func() bool {
-					return agentLogOnNodeContains(targetMasterName,
-						snrparams.CPIsolationDetectedMessage, snrparams.CPIsolationLogWindow)
-				}, snrparams.CPIsolationDetectTimeout, snrparams.DefaultPollInterval).Should(BeTrue(),
-					"Agent on %s must detect that readyz passed while no CP peer is reachable",
-					targetMasterName)
-
-				By("Waiting for the victim agent to stop feeding the watchdog and trigger a reboot")
-
-				Eventually(func() bool {
-					return agentLogOnNodeContains(targetMasterName,
-						snrparams.CPIsolationRebootTriggeredMessage, snrparams.CPIsolationLogWindow)
-				}, snrparams.CPIsolationDetectTimeout, snrparams.DefaultPollInterval).Should(BeTrue(),
-					"Agent on %s must trigger a reboot once isolation is confirmed", targetMasterName)
+				Expect(isolationLog).To(And(
+					ContainSubstring(snrparams.PeerConsultationMessage),
+					ContainSubstring(snrparams.CPIsolationDetectedMessage),
+					ContainSubstring(snrparams.CPIsolationRebootTriggeredMessage),
+				), "Agent on %s must consult peers after maxApiErrorThreshold failures, detect that "+
+					"readyz passed while no CP peer is reachable, and trigger a reboot", targetMasterName)
 
 				By("Waiting for the victim node's boot ID to change")
 
@@ -253,9 +266,10 @@ var _ = Describe("SNR Functional - Control Plane Isolation",
 				getErr := APIClient.Get(ctx, client.ObjectKey{
 					Name: targetMasterName, Namespace: medik8sparams.OperatorNs,
 				}, snrCR)
-				Expect(getErr).To(HaveOccurred(),
-					"No SelfNodeRemediation CR may exist for %s: the reboot must come from the "+
-						"agent's own isolation gate, not from NHC", targetMasterName)
+				Expect(apierrors.IsNotFound(getErr)).To(BeTrue(),
+					"SelfNodeRemediation CR for %s must be absent (IsNotFound); the reboot must come "+
+						"from the agent's own isolation gate, not from NHC. Get returned: %v",
+					targetMasterName, getErr)
 
 				By("Waiting for the victim node to become Ready")
 
